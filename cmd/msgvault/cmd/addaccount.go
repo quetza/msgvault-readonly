@@ -185,7 +185,15 @@ func addAccountTokenReusable(mgr *oauth.Manager, email string, binding addAccoun
 // The hint repeats the flags that determine the grant. Printing a bare
 // add-account to someone who ran --readonly would have them request write
 // access on the retry, silently undoing the narrowing they asked for.
-func addAccountAuthorizeError(err error, sourceExists bool) error {
+func addAccountAuthorizeError(err error, sourceExists bool, email, tokenPath string) error {
+	var wider *oauth.WiderGrantError
+	if errors.As(err, &wider) {
+		return fmt.Errorf(
+			"%w\nThe token was not saved, so nothing here gained that access — but Google\n"+
+				"issued it, which means the account already holds it.\n%s",
+			err, narrowingSteps(email, tokenPath),
+		)
+	}
 	var mismatch *oauth.TokenMismatchError
 	if errors.As(err, &mismatch) && !sourceExists {
 		return fmt.Errorf(
@@ -195,44 +203,6 @@ func addAccountAuthorizeError(err error, sourceExists bool) error {
 		)
 	}
 	return fmt.Errorf("authorization failed: %w", err)
-}
-
-// readonlyGrantWarning checks what actually came back after a --readonly
-// authorization. Requesting read-only does not by itself guarantee a read-only
-// grant: the authorization server decides what to issue, and a response can
-// carry scopes that were not requested. Rather than trust the request, read the
-// recorded grant and say so if any write scope survived.
-//
-// It warns rather than failing, for two reasons. The token is already written
-// and is the account's only credential, so deleting it would trade a too-wide
-// grant for no access at all. And aborting here would stop short of registering
-// the source, leaving a token on disk that no other command can see — while the
-// obvious retry is refused, because the grant now carries the very write access
-// the refusal exists to catch. Warning keeps the account working and puts the
-// remedy in the operator's hands.
-func readonlyGrantWarning(mgr *oauth.Manager, email string) string {
-	granted := oauth.GrantedGmailWriteScopes(mgr.GrantedScopes(email))
-	if len(granted) == 0 {
-		return ""
-	}
-	return fmt.Sprintf(
-		"Warning: authorization for %s returned Gmail write access (%s) despite --readonly.\n"+
-			"The grant is wider than requested. Removing it takes the same steps as any\n"+
-			"other narrowing — revoking alone will not do it, because the refusal reads the\n"+
-			"scopes recorded in the token file:\n%s",
-		email, strings.Join(granted, ", "),
-		narrowingSteps(email, mgr.TokenPath(email)),
-	)
-}
-
-// warnOnWiderThanRequestedGrant prints the readonly grant warning, if any.
-func warnOnWiderThanRequestedGrant(out io.Writer, mgr *oauth.Manager, email string) {
-	if !readonlyGrant {
-		return
-	}
-	if warning := readonlyGrantWarning(mgr, email); warning != "" {
-		_, _ = fmt.Fprintln(out, warning)
-	}
 }
 
 // addAccountGrantFlagSuffix renders the grant-affecting flags of the current
@@ -303,9 +273,8 @@ func preflightAddAccountAuthorize(cmd *cobra.Command, email string) error {
 		fmt.Println("Starting browser authorization...")
 	}
 	if err := mgr.Authorize(cmd.Context(), email); err != nil {
-		return addAccountAuthorizeError(err, sourceExists)
+		return addAccountAuthorizeError(err, sourceExists, email, mgr.TokenPath(email))
 	}
-	warnOnWiderThanRequestedGrant(cmd.OutOrStdout(), mgr, email)
 	// The grant decision is a pre-authorization gate, and it has now been made
 	// for this run. Tell the subprocess so it registers the account instead of
 	// re-litigating the grant: if the authorization above came back wider than
@@ -551,9 +520,8 @@ func runAddAccountLocal(cmd *cobra.Command, args []string) error {
 	}
 
 	if err := oauthMgr.Authorize(cmd.Context(), email); err != nil {
-		return addAccountAuthorizeError(err, existingSource != nil)
+		return addAccountAuthorizeError(err, existingSource != nil, email, oauthMgr.TokenPath(email))
 	}
-	warnOnWiderThanRequestedGrant(cmd.OutOrStdout(), oauthMgr, email)
 
 	// Authorization succeeded — now persist the binding and source.
 	source, err := s.GetOrCreateSource(sourceTypeGmail, email)

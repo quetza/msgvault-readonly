@@ -326,6 +326,158 @@ func TestAuthorize_NarrowedRequestPersistsNarrowedGrant(t *testing.T) {
 		"narrowing must not discard Calendar")
 }
 
+// TestAuthorize_RejectsUnrequestedGmailWriteBeforeSaving is the guarantee that
+// --readonly cannot leave a write-capable credential on disk.
+//
+// Requesting read-only does not oblige the authorization server to issue it. If
+// a wider grant comes back, accepting it and warning afterwards would persist
+// exactly the bearer token the operator declined — and would overwrite a
+// narrower token that was working. Rejecting before saveToken does neither.
+func TestAuthorize_RejectsUnrequestedGmailWriteBeforeSaving(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	const email = "user@example.com"
+
+	srv := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"emailAddress": %q}`, email)
+		}))
+	defer srv.Close()
+
+	mgr := setupTestManager(t, ScopesGmailReadonly)
+	mgr.profileURL = srv.URL
+
+	// A narrower token already on disk, which must survive the rejection.
+	writeTokenFile(t, mgr, email, oauth2.Token{
+		AccessToken: "existing-narrow-token",
+		TokenType:   "Bearer",
+		Expiry:      time.Now().Add(time.Hour),
+	}, []string{ScopeGmailReadonly})
+
+	// Google answers with more than was asked for.
+	mgr.browserFlowFn = func(_ context.Context, _ string, _ bool) (*oauth2.Token, error) {
+		token := &oauth2.Token{
+			AccessToken: "wider-token",
+			TokenType:   "Bearer",
+			Expiry:      time.Now().Add(time.Hour),
+		}
+		return token.WithExtra(map[string]any{
+			"scope": ScopeGmailReadonly + " " + ScopeGmailModify,
+		}), nil
+	}
+
+	err := mgr.Authorize(context.Background(), email)
+
+	require.Error(err)
+	var wider *WiderGrantError
+	require.ErrorAs(err, &wider, "callers need the scopes to build remediation")
+	assert.Contains(wider.Granted, ScopeGmailModify)
+
+	// Nothing wider was persisted, and the working token is untouched.
+	assert.ElementsMatch([]string{ScopeGmailReadonly}, mgr.GrantedScopes(email))
+	loaded, loadErr := mgr.loadToken(email)
+	require.NoError(loadErr)
+	assert.Equal("existing-narrow-token", loaded.AccessToken,
+		"a rejected authorization must not replace the previous token")
+}
+
+// TestAuthorize_AllowsGmailWriteWhenRequested pins that the rejection is scoped
+// to grants nobody asked for. A default run requests write and must keep it.
+func TestAuthorize_AllowsGmailWriteWhenRequested(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	const email = "user@example.com"
+
+	srv := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"emailAddress": %q}`, email)
+		}))
+	defer srv.Close()
+
+	mgr := setupTestManager(t, Scopes)
+	mgr.profileURL = srv.URL
+	mgr.browserFlowFn = func(_ context.Context, _ string, _ bool) (*oauth2.Token, error) {
+		token := &oauth2.Token{
+			AccessToken: "write-token",
+			TokenType:   "Bearer",
+			Expiry:      time.Now().Add(time.Hour),
+		}
+		return token.WithExtra(map[string]any{
+			"scope": ScopeGmailReadonly + " " + ScopeGmailModify,
+		}), nil
+	}
+
+	require.NoError(mgr.Authorize(context.Background(), email))
+	assert.ElementsMatch(Scopes, mgr.GrantedScopes(email))
+}
+
+// TestRejectUnrequestedGmailWrite covers the rule directly, including the
+// non-Gmail grants that must pass through untouched.
+func TestRejectUnrequestedGmailWrite(t *testing.T) {
+	tests := []struct {
+		name      string
+		requested []string
+		granted   []string
+		wantErr   bool
+	}{
+		{
+			name:      "read-only request, read-only grant",
+			requested: ScopesGmailReadonly,
+			granted:   []string{ScopeGmailReadonly},
+		},
+		{
+			name:      "read-only request, write grant",
+			requested: ScopesGmailReadonly,
+			granted:   []string{ScopeGmailReadonly, ScopeGmailModify},
+			wantErr:   true,
+		},
+		{
+			// The unlisted write scope the allow-list exists to catch.
+			name:      "read-only request, unlisted write grant",
+			requested: ScopesGmailReadonly,
+			granted:   []string{ScopeGmailReadonly, "https://www.googleapis.com/auth/gmail.addons.current.action.compose"},
+			wantErr:   true,
+		},
+		{
+			name:      "write request, write grant",
+			requested: Scopes,
+			granted:   Scopes,
+		},
+		{
+			name:      "deletion request, full grant",
+			requested: ScopesDeletion,
+			granted:   []string{ScopeGmailFull},
+		},
+		{
+			// Calendar-only flows request no Gmail at all and must not be
+			// affected by a rule about Gmail write scopes.
+			name:      "calendar request, calendar grant",
+			requested: ScopesCalendar,
+			granted:   []string{ScopeCalendarReadonly},
+		},
+		{
+			name:      "read-only gmail plus calendar keeps calendar",
+			requested: []string{ScopeGmailReadonly, ScopeCalendarReadonly},
+			granted:   []string{ScopeGmailReadonly, ScopeCalendarReadonly},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := rejectUnrequestedGmailWrite(tt.requested, tt.granted)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
+
 // TestAuthorize_StillRejectsUnderDeliveredScopes confirms the narrowing work
 // did not weaken the existing guard: a token that comes back with fewer scopes
 // than requested is still refused.

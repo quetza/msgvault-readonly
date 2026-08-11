@@ -653,58 +653,50 @@ func TestAddAccount_WarnsBeforeRewideningNarrowGrant(t *testing.T) {
 	assert.Contains(out, "--readonly")
 }
 
-// TestReadonlyGrantWarning covers the post-authorization check. Requesting
-// read-only does not guarantee receiving it — the authorization server decides
-// what to issue — so the recorded grant is read back rather than assumed.
+// TestReadonlyPreflightAndDaemonAgreeOnReusability pins the contract between
+// the two processes of a daemon-routed run.
 //
-// It warns rather than failing: the token is already written, and aborting
-// would skip source registration, leaving a token on disk that no command can
-// see while the obvious retry is refused for holding write access.
-func TestReadonlyGrantWarning(t *testing.T) {
-	tests := []struct {
+// The frontend authorizes and then sets --grant-decided, which makes the daemon
+// subprocess skip the grant decision and simply reuse the token. That is only
+// sound if a token the frontend accepted is one the subprocess will accept:
+// otherwise the subprocess finds it non-reusable, opens a second browser flow,
+// and can leave the freshly minted token unregistered if that flow fails.
+//
+// Two rules have to stay aligned for that to hold — oauth rejects a grant
+// carrying unrequested Gmail write access before saving it, and the reuse check
+// refuses a write-capable token under --readonly. This asserts they agree
+// rather than leaving it to be re-derived by hand.
+func TestReadonlyPreflightAndDaemonAgreeOnReusability(t *testing.T) {
+	grants := []struct {
 		name      string
 		tokenJSON string
-		wantWarn  bool
-		wantNamed string
 	}{
-		{
-			name:      "a genuinely narrow grant is silent",
-			tokenJSON: gmailReadonlyCalendarTokenJSON,
-		},
-		{
-			name:      "a returned modify scope is reported",
-			tokenJSON: gmailOnlyTokenJSON,
-			wantWarn:  true,
-			wantNamed: oauth.ScopeGmailModify,
-		},
-		{
-			name:      "a returned full-access scope is reported",
-			tokenJSON: gmailFullOnlyTokenJSON,
-			wantWarn:  true,
-			wantNamed: oauth.ScopeGmailFull,
-		},
+		{"read-only", gmailReadonlyTokenJSON},
+		{"read-only with calendar", gmailReadonlyCalendarTokenJSON},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+	for _, g := range grants {
+		t.Run(g.name, func(t *testing.T) {
 			assert := assert.New(t)
 			require := require.New(t)
 
-			_, restore := seedTokenEnv(t, tt.tokenJSON)
+			_, restore := seedTokenEnv(t, g.tokenJSON)
 			defer restore()
 
 			mgr, err := oauth.NewManager(cfg.OAuth.ClientSecrets, cfg.TokensDir(), logger)
 			require.NoError(err)
 
-			got := readonlyGrantWarning(mgr, scopeEscalationAccount)
+			granted := mgr.GrantedScopes(scopeEscalationAccount)
 
-			if !tt.wantWarn {
-				assert.Empty(got)
-				return
-			}
-			require.NotEmpty(got)
-			assert.Contains(got, tt.wantNamed)
-			assert.Contains(got, "myaccount.google.com/permissions")
+			// Precondition: this is a grant a --readonly authorization can
+			// now produce, i.e. it carries no Gmail write access.
+			require.False(oauth.HasGmailWriteScope(granted),
+				"fixture must represent a grant oauth would accept under --readonly")
+
+			// Therefore the subprocess must find it reusable and register the
+			// account, rather than authorizing again.
+			assert.True(addAccountTokenHasGmailScopes(mgr, scopeEscalationAccount, true),
+				"a token the frontend accepted must be reusable by the daemon")
 		})
 	}
 }

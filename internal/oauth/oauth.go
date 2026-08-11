@@ -536,8 +536,45 @@ func (m *Manager) authorize(
 	if missing := missingScopes(m.config.Scopes, grantedScopes); len(missing) > 0 {
 		return fmt.Errorf("authorized token missing required OAuth scopes: %s", strings.Join(missing, ", "))
 	}
+	if err := rejectUnrequestedGmailWrite(m.config.Scopes, grantedScopes); err != nil {
+		return err
+	}
 
 	return m.saveToken(email, token, grantedScopes)
+}
+
+// WiderGrantError is returned when the authorization server issues Gmail write
+// access that was not requested. Callers can inspect Granted to name the scopes
+// and to attach command-specific remediation.
+type WiderGrantError struct {
+	Granted []string
+}
+
+func (e *WiderGrantError) Error() string {
+	return "authorized token carries Gmail write access that was not requested: " +
+		strings.Join(e.Granted, ", ")
+}
+
+// rejectUnrequestedGmailWrite refuses a grant that confers Gmail write access
+// when none was asked for.
+//
+// It runs before the token is saved, and that ordering is the whole point.
+// Accepting the token and warning afterwards would persist a write-capable
+// bearer credential the operator explicitly declined — and, because Authorize
+// only overwrites the token file after validation, refusing here also leaves
+// any previous narrower token intact rather than trading it for a wider one.
+//
+// The rule is deliberately general rather than keyed to --readonly: if a
+// request carried no Gmail write scope, a response carrying one is not what was
+// asked for, whichever command made the request.
+func rejectUnrequestedGmailWrite(requested, granted []string) error {
+	if HasGmailWriteScope(requested) {
+		return nil
+	}
+	if unrequested := GrantedGmailWriteScopes(granted); len(unrequested) > 0 {
+		return &WiderGrantError{Granted: unrequested}
+	}
+	return nil
 }
 
 const (

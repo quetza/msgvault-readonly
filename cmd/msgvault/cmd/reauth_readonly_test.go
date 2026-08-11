@@ -204,11 +204,11 @@ func TestAddAccountAuthorizeErrorRepeatsReadonly(t *testing.T) {
 	}
 
 	readonlyGrant = true
-	err := addAccountAuthorizeError(mismatch, false)
+	err := addAccountAuthorizeError(mismatch, false, "alias@gmail.com", "/tmp/tokens/alias@gmail.com.json")
 	assert.Contains(err.Error(), "msgvault add-account primary@gmail.com --readonly")
 
 	readonlyGrant = false
-	err = addAccountAuthorizeError(mismatch, false)
+	err = addAccountAuthorizeError(mismatch, false, "alias@gmail.com", "/tmp/tokens/alias@gmail.com.json")
 	assert.Contains(err.Error(), "msgvault add-account primary@gmail.com")
 	assert.NotContains(err.Error(), "--readonly")
 }
